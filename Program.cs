@@ -63,7 +63,7 @@ internal static partial class Program
     /// <param name="output">Output directory for downloaded files.</param>
     /// <param name="branch">Depot branch to download from.</param>
     /// <param name="saveManifest">Save manifest text files to the output directory.</param>
-    private static async Task<int> Run(uint appid, string username, string password, string output, string branch = "public", bool saveManifest = false)
+    private static async Task<int> Run(uint appid, string username, string password, string output, uint cellId = 0 , string branch = "public", bool saveManifest = false)
     {
         using var cts = new CancellationTokenSource();
 
@@ -202,8 +202,8 @@ internal static partial class Program
             LogWarn("Failed to connect/log in after all retries.");
             return 1;
         }
-
-        Console.WriteLine($"Logged in. Cell ID: {logOnResult.CellID}");
+        var useCellId = cellId != 0 ? cellId : logOnResult.CellID;
+        Console.WriteLine($"Logged in. Cell ID: {logOnResult.CellID},User Cell :{useCellId}");
 
         // Fetch CDN servers
         for (var attempt = 0; attempt <= maxRetries; attempt++)
@@ -217,7 +217,7 @@ internal static partial class Program
 
             try
             {
-                var servers = await content.GetServersForSteamPipe(cellId: logOnResult.CellID, maxNumServers: 100);
+                var servers = await content.GetServersForSteamPipe(cellId: useCellId, maxNumServers: 100);
 
                 foreach (var server in servers)
                 {

@@ -23,6 +23,12 @@ internal record struct FileJob(
     DepotManifest DepotManifest
 );
 
+internal sealed record VpkFilter(
+    string[] Extensions,
+    string[] Directories,
+    string[] Files
+);
+
 internal partial class FileDownloader : IDisposable
 {
     private const string PAK01_DIR = "pak01_dir.vpk";
@@ -44,7 +50,7 @@ internal partial class FileDownloader : IDisposable
     private readonly SemaphoreSlim SemaphorePerFile = new(16, 16);
     private readonly SemaphoreSlim SemaphorePerDownloadChunk = new(32, 32);
     private FrozenDictionary<uint, Regex> Files = FrozenDictionary<uint, Regex>.Empty;
-    private FrozenDictionary<uint, string[]> DownloadFromPaks = FrozenDictionary<uint, string[]>.Empty;
+    private FrozenDictionary<uint, VpkFilter> DownloadFromPaks = FrozenDictionary<uint, VpkFilter>.Empty;
     private readonly string OutputFolder;
     private readonly Client CDNClient;
     private readonly Func<Server> GetContentServer;
@@ -75,21 +81,43 @@ internal partial class FileDownloader : IDisposable
         Debug.Assert(files != null);
 
         var filesMapping = new Dictionary<uint, Regex>();
-        var paksMapping = new Dictionary<uint, string[]>();
+        var paksMapping = new Dictionary<uint, VpkFilter>();
 
         foreach (var (depotid, fileMatches) in files)
         {
             var patterns = new List<string>(fileMatches.Count);
+            var extensions = new List<string>();
+            var directories = new List<string>();
+            var vpkFiles = new List<string>();
 
             foreach (var fileMatch in fileMatches)
             {
                 if (fileMatch.StartsWith("vpk:", StringComparison.Ordinal))
                 {
-                    paksMapping.Add(depotid, fileMatch["vpk:".Length..].Split(','));
+                    extensions.AddRange(fileMatch["vpk:".Length..].Split(','));
+                    continue;
+                }
+
+                if (fileMatch.StartsWith("vpk-dic:", StringComparison.Ordinal))
+                {
+                    directories.AddRange(fileMatch["vpk-dic:".Length..].Split(','));
+                    Console.WriteLine($"Downloading from vpk directory: {string.Join(", ", directories)}");
+                    continue;
+                }
+
+                if (fileMatch.StartsWith("vpk-file:", StringComparison.Ordinal))
+                {
+                    vpkFiles.AddRange(fileMatch["vpk-file:".Length..].Split(','));
+                    Console.WriteLine($"Downloading from vpk file: {string.Join(", ", vpkFiles)}");
                     continue;
                 }
 
                 patterns.Add(ConvertFileMatch(fileMatch));
+            }
+
+            if (extensions.Count > 0 || directories.Count > 0 || vpkFiles.Count > 0)
+            {
+                paksMapping.Add(depotid, new VpkFilter(extensions.ToArray(), directories.ToArray(), vpkFiles.ToArray()));
             }
 
             var pattern = $"^({string.Join("|", patterns)})$";
@@ -163,15 +191,15 @@ internal partial class FileDownloader : IDisposable
                 var done = Interlocked.Increment(ref downloadedFiles);
                 var remaining = totalFileCount - done;
                 var action = fileState is DownloadResult.AlreadyValid ? "Validated" : "Downloaded";
-                Console.WriteLine($"[Depot {fileJob.Job.DepotID}] {action} {fileJob.File.FileName} ({remaining} files left)");
+                Console.WriteLine($"[Depot {fileJob.Job.DepotID}] {action} {fileJob.File.FileName} {finalPath.Name} ({remaining} files left)");
 
-                if (finalPath.Name == PAK01_DIR && DownloadFromPaks.TryGetValue(fileJob.Job.DepotID, out var pakExtensions))
+                if (finalPath.Name == PAK01_DIR && DownloadFromPaks.TryGetValue(fileJob.Job.DepotID, out var pakFilter))
                 {
                     HashSet<int> archives;
 
                     try
                     {
-                        archives = ParsePak(finalPath.ToString(), pakExtensions);
+                        archives = ParsePak(finalPath.ToString(), pakFilter);
                     }
                     catch (Exception e)
                     {
@@ -389,7 +417,7 @@ internal partial class FileDownloader : IDisposable
         return false;
     }
 
-    private static HashSet<int> ParsePak(string filePath, string[] extensions)
+    private static HashSet<int> ParsePak(string filePath, VpkFilter filter)
     {
         using var package = new SteamDatabase.ValvePak.Package();
         package.Read(filePath);
@@ -398,7 +426,7 @@ internal partial class FileDownloader : IDisposable
 
         var archives = new HashSet<int>();
 
-        foreach (var ext in extensions)
+        foreach (var ext in filter.Extensions)
         {
             if (package.Entries.TryGetValue(ext, out var entries))
             {
@@ -407,6 +435,40 @@ internal partial class FileDownloader : IDisposable
                     if (entry.ArchiveIndex != 32767)
                     {
                         archives.Add(entry.ArchiveIndex);
+                    }
+                }
+            }
+        }
+
+        if (filter.Directories.Length > 0 || filter.Files.Length > 0)
+        {
+            var dirSet = new HashSet<string>(filter.Directories);
+            var fileSet = new HashSet<string>(filter.Files);
+            Console.WriteLine($"[ParsePak] dic {filter.Directories.Length} filepath {filter.Files.Length}");
+            foreach (var (_, entries) in package.Entries)
+            {
+                foreach (var entry in entries)
+                {
+                    if (entry.ArchiveIndex == 32767)
+                    {
+                        continue;
+                    }
+
+                    foreach (var dir in filter.Directories)
+                    {
+                        var trimmedDir = dir.TrimEnd('/');
+                        if (trimmedDir.Length > 0 && entry.DirectoryName.StartsWith(trimmedDir, StringComparison.Ordinal))
+                        {
+                            archives.Add(entry.ArchiveIndex);
+                            Console.WriteLine($"[vpk-dic] {entry.DirectoryName},index:{entry.ArchiveIndex}");
+                            break;
+                        }
+                    }
+
+                    if (fileSet.Contains($"{entry.DirectoryName}/{entry.FileName}.{entry.TypeName}"))
+                    {
+                        archives.Add(entry.ArchiveIndex);
+                        Console.WriteLine($"[vpk-file] {entry.DirectoryName}/{entry.FileName}.{entry.TypeName},index:{entry.ArchiveIndex}");
                     }
                 }
             }
